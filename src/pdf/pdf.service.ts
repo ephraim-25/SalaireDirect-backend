@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import PDFDocument from 'pdfkit';
 import { SupabaseService } from '../supabase/supabase.service';
 
@@ -244,7 +244,7 @@ export class PdfService {
   ): Promise<Buffer> {
     const client = this.supabase.getClientForUser(accessToken);
 
-    const { data } = await client
+    const { data, error } = await client
       .from('payslips')
       .select(`
         *,
@@ -258,85 +258,223 @@ export class PdfService {
       .eq('id', payslipId)
       .single();
 
-    if (data) {
-      const payrollData = data.payrolls as any;
-      const companyData = payrollData?.companies;
-      const employeeData = data.employees as any;
-
-      return this.generatePayslipPdf({
-        company: {
-          name: companyData?.name || 'SalaireDirect Démo SARL',
-          address: companyData?.address || 'Kinshasa, Gombe',
-          nif: companyData?.nif || 'A01234567Z',
-          cnss_number: companyData?.cnss_number || 'CNSS-CD-2024-001',
-        },
-        employee: {
-          first_name: employeeData?.first_name || 'Salarié',
-          last_name: employeeData?.last_name || 'SalaireDirect',
-          position: employeeData?.position || 'Collaborateur',
-          cnss_number: employeeData?.cnss_number || 'CNSS-SAL-001',
-        },
-        payroll: {
-          month: payrollData?.month || 11,
-          year: payrollData?.year || 2026,
-          usd_cdf_rate: payrollData?.usd_cdf_rate || 2800,
-        },
-        payslip: {
-          base_salary: Number(data.base_salary) || 500,
-          bonuses: Number(data.bonuses) || 0,
-          overtime: Number(data.overtime) || 0,
-          absences_deductions: Number(data.absences_deductions) || 0,
-          advances: Number(data.advances) || 0,
-          gross_salary: Number(data.gross_salary) || 500,
-          cnss_employee: Number(data.cnss_employee) || 17.5,
-          ipr: Number(data.ipr) || 45,
-          net_payable: Number(data.net_payable) || 437.5,
-          cnss_employer: Number(data.cnss_employer) || 29.5,
-          salary_currency: (data.salary_currency as 'USD' | 'CDF') || 'USD',
-        },
-        items: (data.payslip_items as any[]) || [],
-      });
+    if (error || !data) {
+      throw new NotFoundException(
+        `Bulletin de paie ${payslipId} introuvable`,
+      );
     }
 
-    // Si payslipId non trouvé en base (ex: ID temporaire d'une simulation frontend)
-    // On génère un bulletin modèle professionnel
+    const payrollData = data.payrolls as any;
+    const companyData = payrollData?.companies;
+    const employeeData = data.employees as any;
+
     return this.generatePayslipPdf({
       company: {
-        name: 'SalaireDirect Client SARL',
-        address: 'Kinshasa, République Démocratique du Congo',
-        nif: 'A01234567Z',
-        cnss_number: 'CNSS-CD-2024-001',
+        name: companyData?.name || 'Société',
+        address: companyData?.address,
+        nif: companyData?.nif,
+        cnss_number: companyData?.cnss_number,
       },
       employee: {
-        first_name: 'Salarié',
-        last_name: 'Bénéficiaire',
-        position: 'Cadre d’entreprise',
-        cnss_number: 'CNSS-SAL-001',
+        first_name: employeeData?.first_name || 'Salarié',
+        last_name: employeeData?.last_name || '',
+        position: employeeData?.position,
+        cnss_number: employeeData?.cnss_number,
       },
       payroll: {
-        month: 11,
-        year: 2026,
-        usd_cdf_rate: 2800,
+        month: payrollData?.month || 1,
+        year: payrollData?.year || new Date().getFullYear(),
+        usd_cdf_rate: payrollData?.usd_cdf_rate || 2800,
       },
       payslip: {
-        base_salary: 600,
-        bonuses: 50,
-        overtime: 0,
-        absences_deductions: 0,
-        advances: 0,
-        gross_salary: 650,
-        cnss_employee: 22.75,
-        ipr: 68.25,
-        net_payable: 559,
-        cnss_employer: 38.35,
-        salary_currency: 'USD',
+        base_salary: Number(data.base_salary) || 0,
+        bonuses: Number(data.bonuses) || 0,
+        overtime: Number(data.overtime) || 0,
+        absences_deductions: Number(data.absences_deductions) || 0,
+        advances: Number(data.advances) || 0,
+        gross_salary: Number(data.gross_salary) || 0,
+        cnss_employee: Number(data.cnss_employee) || 0,
+        ipr: Number(data.ipr) || 0,
+        net_payable: Number(data.net_payable) || 0,
+        cnss_employer: Number(data.cnss_employer) || 0,
+        salary_currency: (data.salary_currency as 'USD' | 'CDF') || 'USD',
       },
-      items: [
-        { label: 'Salaire de base', item_type: 'earning', amount: 600, currency: 'USD' },
-        { label: 'Prime d’assiduité', item_type: 'earning', amount: 50, currency: 'USD' },
-        { label: 'CNSS Employé (3,5%)', item_type: 'deduction', amount: 22.75, currency: 'USD' },
-        { label: 'IPR (Barème progressif RDC)', item_type: 'deduction', amount: 68.25, currency: 'USD' },
-      ],
+      items: (data.payslip_items as any[]) || [],
+    });
+  }
+
+  /**
+   * Génère le récapitulatif PDF d'une période de paie complète
+   * (tous les bulletins d'un payroll) avec les données réelles de Supabase.
+   */
+  async generatePayrollSummaryPdf(
+    payrollId: string,
+    accessToken: string,
+  ): Promise<Buffer> {
+    const client = this.supabase.getClientForUser(accessToken);
+
+    const { data, error } = await client
+      .from('payrolls')
+      .select(`
+        *,
+        companies(name, address, nif, cnss_number),
+        payslips(
+          id, base_salary, bonuses, overtime, absences_deductions, advances,
+          gross_salary, cnss_employee, ipr, net_payable, cnss_employer,
+          salary_currency,
+          employees(first_name, last_name, position)
+        )
+      `)
+      .eq('id', payrollId)
+      .single();
+
+    if (error || !data) {
+      throw new NotFoundException(`Période de paie ${payrollId} introuvable`);
+    }
+
+    const company = data.companies as any;
+    const payslips = (data.payslips as any[]) || [];
+    const monthLabel =
+      MONTH_NAMES_FR[data.month] || `Mois ${data.month}`;
+
+    return new Promise((resolve, reject) => {
+      const doc = new PDFDocument({
+        size: 'A4',
+        margin: 45,
+        info: {
+          Title: `Récapitulatif de Paie - ${monthLabel} ${data.year}`,
+          Author: 'SalaireDirect Cloud RDC',
+          Subject: `Récapitulatif paie ${monthLabel} ${data.year}`,
+        },
+      });
+
+      const buffers: Buffer[] = [];
+      doc.on('data', (chunk) => buffers.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(buffers)));
+      doc.on('error', reject);
+
+      // ─── EN-TÊTE ────────────────────────────────────────────
+      doc.rect(45, 40, 505, 4).fill('#1E40AF');
+      doc
+        .fontSize(16)
+        .font('Helvetica-Bold')
+        .fillColor('#0F172A')
+        .text('RÉCAPITULATIF DE PAIE', 45, 55, { align: 'left' });
+      doc
+        .fontSize(9)
+        .font('Helvetica')
+        .fillColor('#64748B')
+        .text(
+          `Période : ${monthLabel} ${data.year}  •  ${company?.name || 'Société'}`,
+          45,
+          75,
+        );
+      doc.rect(45, 92, 505, 1).fill('#E2E8F0');
+
+      // ─── TABLEAU DES BULLETINS ──────────────────────────────
+      const tableTop = 110;
+      const colX = 45;
+      const colW = 505;
+      const headerH = 22;
+
+      doc.roundedRect(colX, tableTop, colW, headerH, 4).fill('#1E293B');
+      doc
+        .fillColor('#FFFFFF')
+        .font('Helvetica-Bold')
+        .fontSize(8)
+        .text('SALARIÉ', colX + 10, tableTop + 7)
+        .text('POSTE', colX + 160, tableTop + 7)
+        .text('DEVISE', colX + 260, tableTop + 7)
+        .text('BRUT', colX + 320, tableTop + 7, { width: 70, align: 'right' })
+        .text('CNSS + IPR', colX + 400, tableTop + 7, { width: 70, align: 'right' })
+        .text('NET À PAYER', colX + 475, tableTop + 7, { width: 65, align: 'right' });
+
+      let curY = tableTop + headerH + 4;
+      const totalsByCurrency: Record<string, { gross: number; deductions: number; net: number }> = {};
+
+      payslips.forEach((ps, idx) => {
+        const emp = ps.employees as any;
+        const currency = ps.salary_currency === 'CDF' ? 'CDF' : 'USD';
+        const gross = Number(ps.gross_salary) || 0;
+        const deductions =
+          (Number(ps.cnss_employee) || 0) + (Number(ps.ipr) || 0) + (Number(ps.advances) || 0);
+        const net = Number(ps.net_payable) || 0;
+
+        totalsByCurrency[currency] = totalsByCurrency[currency] || { gross: 0, deductions: 0, net: 0 };
+        totalsByCurrency[currency].gross += gross;
+        totalsByCurrency[currency].deductions += deductions;
+        totalsByCurrency[currency].net += net;
+
+        const rowH = 20;
+        const bg = idx % 2 === 0 ? '#FFFFFF' : '#F8FAFC';
+        if (curY + rowH > 760) {
+          doc.addPage();
+          curY = 50;
+        }
+        doc.rect(colX, curY, colW, rowH).fill(bg);
+
+        doc.font('Helvetica-Bold').fontSize(8).fillColor('#1E293B')
+          .text(
+            `${emp?.last_name || ''} ${emp?.first_name || ''}`.trim() || 'Salarié',
+            colX + 10,
+            curY + 6,
+            { width: 145 },
+          );
+        doc.font('Helvetica').fontSize(7.5).fillColor('#475569')
+          .text(emp?.position || '-', colX + 160, curY + 6, { width: 95 });
+        doc.font('Helvetica-Bold').fontSize(8).fillColor('#1E40AF')
+          .text(currency, colX + 260, curY + 6);
+        doc.font('Helvetica').fontSize(8).fillColor('#0F172A')
+          .text(formatAmount(gross), colX + 320, curY + 6, { width: 70, align: 'right' });
+        doc.fillColor('#DC2626')
+          .text(formatAmount(deductions), colX + 400, curY + 6, { width: 70, align: 'right' });
+        doc.font('Helvetica-Bold').fillColor('#1E3A8A')
+          .text(formatAmount(net), colX + 475, curY + 6, { width: 65, align: 'right' });
+
+        doc.rect(colX, curY + rowH - 0.5, colW, 0.5).fill('#F1F5F9');
+        curY += rowH;
+      });
+
+      if (payslips.length === 0) {
+        doc.font('Helvetica').fontSize(9).fillColor('#64748B')
+          .text('Aucun bulletin enregistré pour cette période.', colX + 10, curY + 10);
+        curY += 24;
+      }
+
+      // ─── TOTAUX PAR DEVISE ──────────────────────────────────
+      curY += 10;
+      doc.roundedRect(colX, curY, colW, 20 + Object.keys(totalsByCurrency).length * 14, 6)
+        .fillAndStroke('#EFF6FF', '#BFDBFE');
+      doc.font('Helvetica-Bold').fontSize(9).fillColor('#1E40AF')
+        .text('TOTAUX GÉNÉRAUX', colX + 12, curY + 7);
+
+      let ty = curY + 22;
+      Object.entries(totalsByCurrency).forEach(([currency, t]) => {
+        doc.font('Helvetica').fontSize(8.5).fillColor('#1E293B');
+        doc.text(
+          `Masse brute : ${formatAmount(t.gross)} ${currency}   •   Retenues : ${formatAmount(t.deductions)} ${currency}   •   Net à payer : ${formatAmount(t.net)} ${currency}`,
+          colX + 12,
+          ty,
+          { width: colW - 24 },
+        );
+        ty += 14;
+      });
+
+      // ─── FOOTER ─────────────────────────────────────────────
+      const footerY = 800;
+      doc.rect(colX, footerY, colW, 0.5).fill('#CBD5E1');
+      doc
+        .font('Helvetica')
+        .fontSize(7.5)
+        .fillColor('#94A3B8')
+        .text(
+          `Document généré le ${new Date().toLocaleDateString('fr-FR')} par SalaireDirect • ${payslips.length} bulletin(s)`,
+          colX,
+          footerY + 8,
+          { align: 'center', width: colW },
+        );
+
+      doc.end();
     });
   }
 }

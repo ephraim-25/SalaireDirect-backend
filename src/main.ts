@@ -16,7 +16,7 @@ async function bootstrap() {
 
   // CORS
   app.enableCors({
-    origin: process.env.CORS_ORIGIN || 'http://localhost:3001',
+    origin: process.env.CORS_ORIGIN || ['https://salaire-direct-frontend.vercel.app', 'http://localhost:3000'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   });
@@ -31,7 +31,7 @@ async function bootstrap() {
   ╔══════════════════════════════════════════════════╗
   ║      🚀 SalaireDirect Backend Started            ║
   ║      Supabase: szxgouaihkxuomfguxbz              ║
-  ║      API: http://localhost:${port}/api/v1          ║
+  ║      API: https://salairedirect-backend.onrender.com/api/v1          ║
   ╚══════════════════════════════════════════════════╝
   `);
 }

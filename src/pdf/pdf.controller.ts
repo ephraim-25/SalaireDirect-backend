@@ -32,6 +32,30 @@ export class PdfController {
   }
 
   /**
+   * Télécharge le récapitulatif PDF d'une période de paie complète
+   * GET /pdf/payroll-summary/:id
+   */
+  @Get('payroll-summary/:id')
+  async downloadPayrollSummary(
+    @Param('id') payrollId: string,
+    @AccessToken() token: string,
+    @Res() res: Response,
+  ) {
+    const pdfBuffer = await this.pdfService.generatePayrollSummaryPdf(
+      payrollId,
+      token,
+    );
+
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="recapitulatif-${payrollId}.pdf"`,
+      'Content-Length': pdfBuffer.length,
+    });
+
+    res.end(pdfBuffer);
+  }
+
+  /**
    * Génération instantanée d'un bulletin PDF à partir des données transmises
    * POST /pdf/generate
    */
