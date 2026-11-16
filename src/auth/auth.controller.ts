@@ -1,23 +1,25 @@
-import { Controller, Post, Get, Body } from '@nestjs/common';
+import { Controller, Get } from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { CurrentUser, AccessToken } from './decorators/current-user.decorator';
+import {
+  AccessToken,
+  CompanyId,
+  CurrentUser,
+} from './decorators/current-user.decorator';
 
+/**
+ * L'inscription, la connexion et la réinitialisation du mot de passe passent directement
+ * par Supabase Auth (côté frontend). Le backend ne fait que vérifier le jeton obtenu.
+ */
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
-  @Post('register')
-  register(@Body() dto: any) {
-    return this.authService.register(dto);
-  }
-
-  @Post('login')
-  login(@Body() dto: any) {
-    return this.authService.login(dto);
-  }
-
   @Get('me')
-  getMe(@CurrentUser() user: any, @AccessToken() token: string) {
-    return this.authService.getMe(user?.id, token);
+  getMe(
+    @CurrentUser() user: { id: string; email?: string },
+    @CompanyId() companyId: string,
+    @AccessToken() token: string,
+  ) {
+    return this.authService.getMe(user, companyId, token);
   }
 }
