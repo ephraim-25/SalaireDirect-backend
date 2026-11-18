@@ -1,35 +1,86 @@
 import {
   Injectable,
+  Logger,
   NotFoundException,
   BadRequestException,
+  ConflictException,
   InternalServerErrorException,
 } from '@nestjs/common';
 import { SupabaseService } from '../supabase/supabase.service';
 import { CreatePayrollDto } from './dto/create-payroll.dto';
 import { CreatePayslipDto } from './dto/create-payslip.dto';
 import {
+  CalculatePayrollDto,
+  CreateVariableDto,
+  PayrollEntryDto,
+  SaveMonthDto,
+} from './dto/payroll-inputs.dto';
+import {
   calculatePayslip,
   LegalParameters,
+  PayslipCalculationResult,
 } from './engines/payroll-calculator.engine';
+
+type LegalParametersRecord = LegalParameters & {
+  id: string;
+  effective_date: string;
+  /** true si aucun barème n'est enregistré en base et que les valeurs de repli sont utilisées. */
+  is_default?: boolean;
+};
+
+/** Valeurs de repli (RDC 2024), utilisées UNIQUEMENT si la table `legal_parameters` est vide. */
+const FALLBACK_LEGAL_PARAMETERS: LegalParametersRecord = {
+  id: '0da65001-7b94-4c96-bbd8-9f6da81b33bc',
+  effective_date: '2024-01-01',
+  is_default: true,
+  cnss_employee_rate: 0.035,
+  cnss_employer_rate: 0.059,
+  family_allowance_per_child: 12000,
+  smig_rate: 7075,
+  ipr_brackets: [
+    { min: 0, max: 524999, rate: 0.0, cumulative_tax_below: 0 },
+    { min: 525000, max: 1269999, rate: 0.15, cumulative_tax_below: 0 },
+    { min: 1270000, max: 2114999, rate: 0.2, cumulative_tax_below: 111750 },
+    { min: 2115000, max: 3304999, rate: 0.225, cumulative_tax_below: 280750 },
+    { min: 3305000, max: 4894999, rate: 0.25, cumulative_tax_below: 548500 },
+    { min: 4895000, max: 7254999, rate: 0.3, cumulative_tax_below: 945750 },
+    { min: 7255000, max: 10679999, rate: 0.35, cumulative_tax_below: 1653750 },
+    { min: 10680000, max: null, rate: 0.4, cumulative_tax_below: 2852750 },
+  ],
+};
+
+interface EmployeeRow {
+  id: string;
+  first_name: string;
+  last_name: string;
+  base_salary: number;
+  salary_currency: 'USD' | 'CDF';
+  dependent_children: number;
+}
+
+interface ComputedPayslip {
+  employee: EmployeeRow;
+  calc: PayslipCalculationResult;
+}
+
+const firstOfMonth = (year: number, month: number) =>
+  `${year}-${String(month).padStart(2, '0')}-01`;
 
 @Injectable()
 export class PayrollService {
+  private readonly logger = new Logger(PayrollService.name);
+
   constructor(private readonly supabase: SupabaseService) {}
 
-  async getDefaultCompanyId(accessToken: string = 'dev-token'): Promise<string> {
-    const client = this.supabase.getClientForUser(accessToken);
-    const { data } = await client.from('companies').select('id').limit(1).single();
-    return data?.id || '00000000-0000-0000-0000-000000000001';
-  }
+  /* ------------------------------------------------------------------ */
+  /*  Paramètres légaux                                                  */
+  /* ------------------------------------------------------------------ */
 
-  /**
-   * Récupère les paramètres légaux applicables pour une date donnée.
-   * Prend le dernier barème dont effective_date <= date fournie.
-   */
+  /** Dernier barème dont effective_date <= date fournie (date du jour par défaut). */
   async getApplicableLegalParameters(
-    forDate: string = '2024-01-01',
-    accessToken: string = 'dev-token',
-  ): Promise<LegalParameters & { id: string; effective_date: string }> {
+    forDate: string = new Date().toISOString().slice(0, 10),
+    accessToken: string,
+  ): Promise<LegalParametersRecord> {
     const client = this.supabase.getClientForUser(accessToken);
 
     const { data } = await client
@@ -38,300 +89,328 @@ export class PayrollService {
       .lte('effective_date', forDate)
       .order('effective_date', { ascending: false })
       .limit(1)
-      .single();
+      .maybeSingle();
 
     if (data) {
       return {
         ...data,
-        ipr_brackets: data.ipr_brackets as any,
+        ipr_brackets:
+          data.ipr_brackets as unknown as LegalParameters['ipr_brackets'],
       };
     }
 
-    // Paramètres légaux par défaut (Code des Impôts RDC 2024)
-    return {
-      id: '0da65001-7b94-4c96-bbd8-9f6da81b33bc',
-      effective_date: '2024-01-01',
-      cnss_employee_rate: 0.035,
-      cnss_employer_rate: 0.059,
-      family_allowance_per_child: 12000,
-      smig_rate: 7075,
-      ipr_brackets: [
-        { min: 0, max: 524999, rate: 0.0, cumulative_tax_below: 0 },
-        { min: 525000, max: 1269999, rate: 0.15, cumulative_tax_below: 0 },
-        { min: 1270000, max: 2114999, rate: 0.2, cumulative_tax_below: 111750 },
-        { min: 2115000, max: 3304999, rate: 0.225, cumulative_tax_below: 280750 },
-        { min: 3305000, max: 4894999, rate: 0.25, cumulative_tax_below: 548500 },
-        { min: 4895000, max: 7254999, rate: 0.3, cumulative_tax_below: 945750 },
-        { min: 7255000, max: 10679999, rate: 0.35, cumulative_tax_below: 1653750 },
-        { min: 10680000, max: null, rate: 0.4, cumulative_tax_below: 2852750 },
-      ],
-    };
+    this.logger.warn(
+      `Aucun barème légal en base pour le ${forDate} : utilisation des valeurs de repli (${FALLBACK_LEGAL_PARAMETERS.effective_date}).`,
+    );
+    return FALLBACK_LEGAL_PARAMETERS;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Calcul                                                             */
+  /* ------------------------------------------------------------------ */
+
+  /** Charge les salariés demandés ET vérifie qu'ils appartiennent bien à l'entreprise. */
+  private async loadEmployees(
+    ids: string[],
+    companyId: string,
+    accessToken: string,
+  ): Promise<Map<string, EmployeeRow>> {
+    const client = this.supabase.getClientForUser(accessToken);
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) return new Map();
+
+    const { data, error } = await client
+      .from('employees')
+      .select(
+        'id, first_name, last_name, base_salary, salary_currency, dependent_children',
+      )
+      .eq('company_id', companyId)
+      .in('id', unique);
+
+    if (error) throw new InternalServerErrorException(error.message);
+
+    const map = new Map<string, EmployeeRow>(
+      (data ?? []).map((e) => [e.id, e as EmployeeRow]),
+    );
+    const missing = unique.filter((id) => !map.has(id));
+    if (missing.length > 0) {
+      throw new BadRequestException(
+        `Employé(s) introuvable(s) dans votre entreprise : ${missing.join(', ')}`,
+      );
+    }
+    return map;
   }
 
   /**
-   * Calcul dynamique / simulation de la paie sans obligation de persistance.
-   * Peut calculer pour un employé unique ou pour l'ensemble des employés du mois.
+   * Calcule les bulletins. Le salaire de base, la devise et les enfants à charge viennent de la base
+   * (jamais du navigateur) ; seules les variables du mois sont fournies par le client.
    */
-  async calculateSimulation(
-    payload: {
-      month?: number;
-      year?: number;
-      company_id?: string;
-      usd_cdf_rate?: number;
-      employees?: Array<{
-        employeeId?: string;
-        employee_id?: string;
-        employeeName?: string;
-        baseSalary?: number;
-        base_salary?: number;
-        currency?: 'USD' | 'CDF';
-        salary_currency?: 'USD' | 'CDF';
-        primes?: number;
-        bonuses?: number;
-        overtime?: number;
-        absences?: number;
-        absences_deductions?: number;
-        advances?: number;
-        numberOfDependents?: number;
-        dependent_children?: number;
-      }>;
-      base_salary?: number;
-      bonuses?: number;
-      overtime?: number;
-      absences_deductions?: number;
-      advances?: number;
-      dependent_children?: number;
-      salary_currency?: 'USD' | 'CDF';
-    },
-    accessToken: string = 'dev-token',
+  private async compute(
+    entries: PayrollEntryDto[],
+    period: { month: number; year: number; usd_cdf_rate: number },
+    companyId: string,
+    accessToken: string,
   ) {
-    const usd_cdf_rate = payload.usd_cdf_rate || 2800; // Taux USD/CDF indicatif marché
-    const refDate = `${payload.year || 2026}-${String(payload.month || 11).padStart(2, '0')}-01`;
-    const legalParams = await this.getApplicableLegalParameters(refDate, accessToken);
+    const legalParams = await this.getApplicableLegalParameters(
+      firstOfMonth(period.year, period.month),
+      accessToken,
+    );
+    const employees = await this.loadEmployees(
+      entries.map((e) => e.employeeId),
+      companyId,
+      accessToken,
+    );
 
-    // Si une liste d'employés est fournie dans payload
-    if (payload.employees && payload.employees.length > 0) {
-      const results = payload.employees.map((emp) => {
-        const base_salary = Number(emp.baseSalary ?? emp.base_salary ?? 0);
-        const currency = (emp.currency === 'CDF' || emp.salary_currency === 'CDF' ? 'CDF' : 'USD') as 'USD' | 'CDF';
-        const bonuses = Number(emp.primes ?? emp.bonuses ?? 0);
-        const overtime = Number(emp.overtime ?? 0);
-        const absences = Number(emp.absences ?? emp.absences_deductions ?? 0);
-        const advances = Number(emp.advances ?? 0);
-        const dependent_children = Number(emp.numberOfDependents ?? emp.dependent_children ?? 0);
-
-        const calc = calculatePayslip(
-          {
-            base_salary,
-            salary_currency: currency,
-            bonuses,
-            overtime,
-            absences_deductions: absences,
-            advances,
-            dependent_children,
-            usd_cdf_rate,
-          },
-          legalParams,
-        );
-
-        return {
-          employeeId: emp.employeeId || emp.employee_id || '',
-          employeeName: emp.employeeName || 'Employé',
-          baseSalary: calc.base_salary,
-          currency,
-          primes: calc.bonuses,
-          overtime: calc.overtime,
-          absences: calc.absences_deductions,
-          advances: calc.advances,
-          grossSalary: calc.gross_salary,
-          cnssEmployee: calc.cnss_employee,
-          cnssEmployer: calc.cnss_employer,
-          ipr: calc.ipr,
-          netSalary: calc.net_payable,
-          items: calc.items,
-        };
-      });
-
-      return {
-        month: payload.month || 11,
-        year: payload.year || 2026,
-        usd_cdf_rate,
-        legal_parameters: {
-          cnss_employee_rate: legalParams.cnss_employee_rate,
-          cnss_employer_rate: legalParams.cnss_employer_rate,
-          effective_date: legalParams.effective_date,
+    const computed: ComputedPayslip[] = entries.map((entry) => {
+      const employee = employees.get(entry.employeeId)!;
+      const calc = calculatePayslip(
+        {
+          base_salary: Number(employee.base_salary) || 0,
+          salary_currency: employee.salary_currency,
+          bonuses: entry.primes ?? 0,
+          overtime: entry.overtime ?? 0,
+          absences_deductions: entry.absences ?? 0,
+          advances: entry.advances ?? 0,
+          dependent_children: employee.dependent_children ?? 0,
+          usd_cdf_rate: period.usd_cdf_rate,
         },
-        calculations: results,
-      };
-    }
+        legalParams,
+      );
+      return { employee, calc };
+    });
 
-    // Calcul pour un seul employé / formulaire
-    const calc = calculatePayslip(
-      {
-        base_salary: Number(payload.base_salary || 0),
-        salary_currency: payload.salary_currency || 'USD',
-        bonuses: Number(payload.bonuses || 0),
-        overtime: Number(payload.overtime || 0),
-        absences_deductions: Number(payload.absences_deductions || 0),
-        advances: Number(payload.advances || 0),
-        dependent_children: Number(payload.dependent_children || 0),
-        usd_cdf_rate,
-      },
-      legalParams,
+    return { computed, legalParams };
+  }
+
+  /** Simulation : calcule sans rien enregistrer. */
+  async calculateSimulation(
+    dto: CalculatePayrollDto,
+    companyId: string,
+    accessToken: string,
+  ) {
+    const { computed, legalParams } = await this.compute(
+      dto.employees,
+      dto,
+      companyId,
+      accessToken,
     );
 
     return {
-      usd_cdf_rate,
-      calculation: calc,
+      month: dto.month,
+      year: dto.year,
+      usd_cdf_rate: dto.usd_cdf_rate,
+      legal_parameters: {
+        cnss_employee_rate: legalParams.cnss_employee_rate,
+        cnss_employer_rate: legalParams.cnss_employer_rate,
+        effective_date: legalParams.effective_date,
+        is_default: legalParams.is_default ?? false,
+      },
+      calculations: computed.map(({ employee, calc }) => ({
+        employeeId: employee.id,
+        employeeName: `${employee.first_name} ${employee.last_name}`,
+        baseSalary: calc.base_salary,
+        currency: employee.salary_currency,
+        primes: calc.bonuses,
+        overtime: calc.overtime,
+        absences: calc.absences_deductions,
+        advances: calc.advances,
+        grossSalary: calc.gross_salary,
+        cnssEmployee: calc.cnss_employee,
+        cnssEmployer: calc.cnss_employer,
+        ipr: calc.ipr,
+        netSalary: calc.net_payable,
+        items: calc.items,
+      })),
     };
   }
 
+  /* ------------------------------------------------------------------ */
+  /*  Enregistrement / clôture d'un mois                                 */
+  /* ------------------------------------------------------------------ */
+
   /**
-   * Enregistrement complet ou clôture d'un mois de paie avec tous ses bulletins
+   * Enregistre (brouillon) ou clôture un mois de paie. Les montants sont RECALCULÉS par le serveur :
+   * les montants envoyés par le navigateur ne sont pas pris en compte. Une paie clôturée est définitive.
    */
   async saveMonthPayroll(
-    payload: {
-      month: number;
-      year: number;
-      company_id?: string;
-      usd_cdf_rate?: number;
-      status?: 'draft' | 'closed';
-      calculations?: any[];
-    },
-    accessToken: string = 'dev-token',
+    dto: SaveMonthDto,
+    companyId: string,
+    accessToken: string,
   ) {
-    const client = this.supabase.getClientForUser(accessToken) as any;
-    const company_id = payload.company_id || (await this.getDefaultCompanyId(accessToken));
-    const refDate = `${payload.year}-${String(payload.month).padStart(2, '0')}-01`;
-    const legalParams = await this.getApplicableLegalParameters(refDate, accessToken);
+    const client = this.supabase.getClientForUser(accessToken);
+    const isClosed = dto.status === 'closed';
 
-    const isClosed = payload.status === 'closed';
+    const { data: existing, error: existingError } = await client
+      .from('payrolls')
+      .select('id, status')
+      .eq('company_id', companyId)
+      .eq('month', dto.month)
+      .eq('year', dto.year)
+      .maybeSingle();
+    if (existingError)
+      throw new InternalServerErrorException(existingError.message);
+
+    if (existing?.status === 'closed') {
+      throw new ConflictException(
+        `La paie de ${String(dto.month).padStart(2, '0')}/${dto.year} est déjà clôturée et ne peut plus être modifiée.`,
+      );
+    }
+
+    const { computed, legalParams } = await this.compute(
+      dto.calculations,
+      dto,
+      companyId,
+      accessToken,
+    );
 
     const { data: payroll, error: pError } = await client
       .from('payrolls')
       .upsert(
         {
-          company_id,
-          month: Number(payload.month),
-          year: Number(payload.year),
-          usd_cdf_rate: Number(payload.usd_cdf_rate || 2800),
-          status: payload.status || 'draft',
+          company_id: companyId,
+          month: dto.month,
+          year: dto.year,
+          usd_cdf_rate: dto.usd_cdf_rate,
+          status: isClosed ? 'closed' : 'draft',
           legal_parameters_id: legalParams.id,
-          legal_parameters_snapshot: isClosed ? legalParams : null,
+          legal_parameters_snapshot: isClosed ? (legalParams as any) : null,
           closed_at: isClosed ? new Date().toISOString() : null,
         },
-        { onConflict: 'company_id,month,year' }
+        { onConflict: 'company_id,month,year' },
       )
       .select()
       .single();
+    if (pError || !payroll)
+      throw new InternalServerErrorException(
+        pError?.message ?? 'Enregistrement impossible',
+      );
 
-    if (pError) throw new InternalServerErrorException(pError.message);
-
-    // Enregistrer les bulletins de chaque employé
     const savedPayslips: any[] = [];
-    if (payroll && payload.calculations && payload.calculations.length > 0) {
-      for (const calc of payload.calculations) {
-        if (!calc.employeeId) continue;
-        const currency = calc.currency === 'CDF' || calc.currency === 'FC' ? 'CDF' : 'USD';
-
-        const { data: ps, error: psErr } = await client
-          .from('payslips')
-          .upsert(
-            {
-              payroll_id: payroll.id,
-              employee_id: calc.employeeId,
-              base_salary: Number(calc.baseSalary || 0),
-              salary_currency: currency,
-              bonuses: Number(calc.primes || 0),
-              overtime: Number(calc.overtime || 0),
-              absences_deductions: Number(calc.absences || 0),
-              advances: Number(calc.advances || 0),
-              gross_salary: Number(calc.grossSalary || 0),
-              cnss_employee: Number(calc.cnssEmployee || 0),
-              ipr: Number(calc.ipr || 0),
-              net_payable: Number(calc.netSalary || 0),
-              cnss_employer: Number(calc.cnssEmployer || 0),
-            },
-            { onConflict: 'payroll_id,employee_id' }
-          )
-          .select()
-          .single();
-
-        if (ps) {
-          savedPayslips.push(ps);
-
-          if (calc.items && Array.isArray(calc.items) && calc.items.length > 0) {
-            await client.from('payslip_items').delete().eq('payslip_id', ps.id);
-            await client.from('payslip_items').insert(
-              calc.items.map((it: any) => ({
-                payslip_id: ps.id,
-                label: it.label,
-                item_type: it.item_type,
-                amount: Number(it.amount || 0),
-                currency: it.currency === 'CDF' || it.currency === 'FC' ? 'CDF' : 'USD',
-                sort_order: it.sort_order || 0,
-              }))
-            );
-          }
-        }
-      }
+    for (const { employee, calc } of computed) {
+      const slip = await this.upsertPayslip(client, payroll.id, employee, calc);
+      savedPayslips.push(slip);
     }
 
     return {
-      message: isClosed ? 'Mois de paie clôturé et archivé avec succès' : 'Mois de paie enregistré avec succès',
+      message: isClosed
+        ? 'Mois de paie clôturé et archivé avec succès'
+        : 'Mois de paie enregistré avec succès',
       payroll,
       payslipsCount: savedPayslips.length,
       payslips: savedPayslips,
     };
   }
 
-  /**
-   * Historique complet des périodes de paie
-   */
-  async findAllPayrolls(companyId?: string, accessToken: string = 'dev-token') {
-    const client = this.supabase.getClientForUser(accessToken) as any;
-    let query = client
+  private async upsertPayslip(
+    client: ReturnType<SupabaseService['getClientForUser']>,
+    payrollId: string,
+    employee: EmployeeRow,
+    calc: PayslipCalculationResult,
+  ) {
+    const { data: payslip, error } = await client
+      .from('payslips')
+      .upsert(
+        {
+          payroll_id: payrollId,
+          employee_id: employee.id,
+          base_salary: calc.base_salary,
+          salary_currency: employee.salary_currency,
+          bonuses: calc.bonuses,
+          overtime: calc.overtime,
+          absences_deductions: calc.absences_deductions,
+          advances: calc.advances,
+          gross_salary: calc.gross_salary,
+          cnss_employee: calc.cnss_employee,
+          ipr: calc.ipr,
+          net_payable: calc.net_payable,
+          cnss_employer: calc.cnss_employer,
+        },
+        { onConflict: 'payroll_id,employee_id' },
+      )
+      .select()
+      .single();
+
+    if (error || !payslip) {
+      throw new InternalServerErrorException(
+        `Bulletin de ${employee.first_name} ${employee.last_name} non enregistré : ${error?.message ?? 'erreur inconnue'}`,
+      );
+    }
+
+    const { error: delError } = await client
+      .from('payslip_items')
+      .delete()
+      .eq('payslip_id', payslip.id);
+    if (delError) throw new InternalServerErrorException(delError.message);
+
+    const { error: itemsError } = await client
+      .from('payslip_items')
+      .insert(calc.items.map((item) => ({ ...item, payslip_id: payslip.id })));
+    if (itemsError) throw new InternalServerErrorException(itemsError.message);
+
+    return payslip;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Historique                                                         */
+  /* ------------------------------------------------------------------ */
+
+  async findAllPayrolls(companyId: string, accessToken: string) {
+    const client = this.supabase.getClientForUser(accessToken);
+    const { data, error } = await client
       .from('payrolls')
-      .select(`
-        *,
+      .select(
+        `*,
         companies(name, main_currency),
         payslips(
-          id,
-          employee_id,
-          base_salary,
-          bonuses,
-          overtime,
-          absences_deductions,
-          advances,
-          gross_salary,
-          cnss_employee,
-          ipr,
-          net_payable,
-          cnss_employer,
-          salary_currency,
+          id, employee_id, base_salary, bonuses, overtime, absences_deductions, advances,
+          gross_salary, cnss_employee, ipr, net_payable, cnss_employer, salary_currency,
           employees(first_name, last_name, position, cnss_number)
-        )
-      `)
+        )`,
+      )
+      .eq('company_id', companyId)
       .order('year', { ascending: false })
       .order('month', { ascending: false });
 
-    if (companyId) {
-      query = query.eq('company_id', companyId);
-    }
-
-    const { data, error } = await query;
     if (error) throw new InternalServerErrorException(error.message);
-    return data || [];
+    return data ?? [];
   }
 
-  // --- Gestion des variables du mois ---
+  /* ------------------------------------------------------------------ */
+  /*  Variables du mois                                                  */
+  /* ------------------------------------------------------------------ */
+
+  /** `monthly_variables` n'est pas dans les types générés : accès non typé, mais toujours borné à l'entreprise. */
+  private variablesTable(accessToken: string) {
+    return (this.supabase.getClientForUser(accessToken) as any).from(
+      'monthly_variables',
+    );
+  }
+
+  private async companyEmployeeIds(
+    companyId: string,
+    accessToken: string,
+  ): Promise<string[]> {
+    const client = this.supabase.getClientForUser(accessToken);
+    const { data, error } = await client
+      .from('employees')
+      .select('id')
+      .eq('company_id', companyId);
+    if (error) throw new InternalServerErrorException(error.message);
+    return (data ?? []).map((e) => e.id);
+  }
 
   async getVariables(
     params: { month?: number; year?: number; employee_id?: string },
-    accessToken: string = 'dev-token',
+    companyId: string,
+    accessToken: string,
   ) {
-    const client = this.supabase.getClientForUser(accessToken) as any;
-    let query = client.from('monthly_variables').select('*').order('created_at', { ascending: false });
+    const ids = await this.companyEmployeeIds(companyId, accessToken);
+    if (ids.length === 0) return [];
+
+    let query = this.variablesTable(accessToken)
+      .select('*')
+      .in('employee_id', ids)
+      .order('created_at', { ascending: false });
 
     if (params.month) query = query.eq('month', params.month);
     if (params.year) query = query.eq('year', params.year);
@@ -339,39 +418,36 @@ export class PayrollService {
 
     const { data, error } = await query;
     if (error) throw new InternalServerErrorException(error.message);
-    return data || [];
+    return data ?? [];
   }
 
   async createVariable(
-    dto: {
-      employeeId?: string;
-      employee_id?: string;
-      type: 'prime' | 'heures_sup' | 'absence' | 'avance';
-      amount?: number;
-      quantity?: number;
-      description: string;
-      month: number | string;
-      year: number | string;
-    },
-    accessToken: string = 'dev-token',
+    dto: CreateVariableDto,
+    companyId: string,
+    accessToken: string,
   ) {
-    const client = this.supabase.getClientForUser(accessToken) as any;
-
-    const employee_id = dto.employee_id || dto.employeeId;
-    if (!employee_id) {
-      throw new BadRequestException("L'identifiant de l'employé est requis");
+    const needsAmount = dto.type === 'prime' || dto.type === 'avance';
+    const value = needsAmount ? dto.amount : dto.quantity;
+    if (!(Number(value) > 0)) {
+      throw new BadRequestException(
+        needsAmount
+          ? 'Un montant supérieur à zéro est requis.'
+          : 'Une quantité supérieure à zéro est requise.',
+      );
     }
 
-    const { data, error } = await client
-      .from('monthly_variables')
+    // Le salarié doit appartenir à l'entreprise de l'utilisateur.
+    await this.loadEmployees([dto.employee_id], companyId, accessToken);
+
+    const { data, error } = await this.variablesTable(accessToken)
       .insert({
-        employee_id,
+        employee_id: dto.employee_id,
         type: dto.type,
-        amount: dto.amount != null ? Number(dto.amount) : null,
-        quantity: dto.quantity != null ? Number(dto.quantity) : null,
+        amount: needsAmount ? dto.amount : null,
+        quantity: needsAmount ? null : dto.quantity,
         description: dto.description,
-        month: parseInt(String(dto.month), 10),
-        year: parseInt(String(dto.year), 10),
+        month: dto.month,
+        year: dto.year,
       })
       .select()
       .single();
@@ -380,40 +456,71 @@ export class PayrollService {
     return data;
   }
 
-  async deleteVariable(id: string, accessToken: string = 'dev-token') {
-    const client = this.supabase.getClientForUser(accessToken) as any;
-    const { error } = await client.from('monthly_variables').delete().eq('id', id);
+  async deleteVariable(id: string, companyId: string, accessToken: string) {
+    const ids = await this.companyEmployeeIds(companyId, accessToken);
+    if (ids.length === 0) throw new NotFoundException('Variable introuvable');
+
+    const { data, error } = await this.variablesTable(accessToken)
+      .delete()
+      .eq('id', id)
+      .in('employee_id', ids)
+      .select('id');
+
     if (error) throw new InternalServerErrorException(error.message);
+    if (!data || data.length === 0)
+      throw new NotFoundException('Variable introuvable');
     return { message: 'Variable supprimée avec succès' };
   }
 
-  // --- Payrolls existants ---
+  /* ------------------------------------------------------------------ */
+  /*  Paies individuelles (API détaillée)                                */
+  /* ------------------------------------------------------------------ */
 
-  async findAll(companyId: string, accessToken: string) {
-    return this.findAllPayrolls(companyId, accessToken);
+  /** Retourne la paie si elle appartient à l'entreprise, sinon 404. */
+  private async getOwnPayroll(
+    payrollId: string,
+    companyId: string,
+    accessToken: string,
+  ) {
+    const client = this.supabase.getClientForUser(accessToken);
+    const { data, error } = await client
+      .from('payrolls')
+      .select('*, legal_parameters(*)')
+      .eq('id', payrollId)
+      .eq('company_id', companyId)
+      .maybeSingle();
+
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!data) throw new NotFoundException(`Payroll ${payrollId} introuvable`);
+    return data;
   }
 
-  async create(dto: CreatePayrollDto, accessToken: string) {
+  async create(dto: CreatePayrollDto, companyId: string, accessToken: string) {
     const client = this.supabase.getClientForUser(accessToken);
+
     const { data: existing } = await client
       .from('payrolls')
       .select('id')
-      .eq('company_id', dto.company_id)
+      .eq('company_id', companyId)
       .eq('month', dto.month)
       .eq('year', dto.year)
-      .single();
+      .maybeSingle();
 
     if (existing) {
-      throw new BadRequestException(`Un payroll existe déjà pour ${dto.month}/${dto.year}`);
+      throw new BadRequestException(
+        `Un payroll existe déjà pour ${dto.month}/${dto.year}`,
+      );
     }
 
-    const refDate = `${dto.year}-${String(dto.month).padStart(2, '0')}-01`;
-    const legalParams = await this.getApplicableLegalParameters(refDate, accessToken);
+    const legalParams = await this.getApplicableLegalParameters(
+      firstOfMonth(dto.year, dto.month),
+      accessToken,
+    );
 
     const { data, error } = await client
       .from('payrolls')
       .insert({
-        company_id: dto.company_id,
+        company_id: companyId,
         month: dto.month,
         year: dto.year,
         usd_cdf_rate: dto.usd_cdf_rate,
@@ -427,104 +534,80 @@ export class PayrollService {
     return data;
   }
 
-  async findOne(payrollId: string, accessToken: string) {
+  async findOne(payrollId: string, companyId: string, accessToken: string) {
     const client = this.supabase.getClientForUser(accessToken);
     const { data, error } = await client
       .from('payrolls')
-      .select(`*, payslips(*, employees(first_name, last_name, position), payslip_items(*))`)
+      .select(
+        `*, payslips(*, employees(first_name, last_name, position), payslip_items(*))`,
+      )
       .eq('id', payrollId)
-      .single();
+      .eq('company_id', companyId)
+      .maybeSingle();
 
-    if (error) throw new NotFoundException(`Payroll ${payrollId} introuvable`);
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!data) throw new NotFoundException(`Payroll ${payrollId} introuvable`);
     return data;
   }
 
   async calculateAndSavePayslip(
     payrollId: string,
     dto: CreatePayslipDto,
+    companyId: string,
     accessToken: string,
   ) {
     const client = this.supabase.getClientForUser(accessToken);
-    const { data: payroll, error: payrollError } = await client
-      .from('payrolls')
-      .select('*, legal_parameters(*)')
-      .eq('id', payrollId)
-      .single();
+    const payroll = await this.getOwnPayroll(payrollId, companyId, accessToken);
 
-    if (payrollError || !payroll) {
-      throw new NotFoundException(`Payroll ${payrollId} introuvable`);
+    if (payroll.status === 'closed') {
+      throw new ConflictException(
+        'Cette paie est clôturée et ne peut plus être modifiée.',
+      );
     }
 
-    const { data: employee, error: empError } = await client
-      .from('employees')
-      .select('*')
-      .eq('id', dto.employee_id)
-      .single();
+    const employees = await this.loadEmployees(
+      [dto.employee_id],
+      companyId,
+      accessToken,
+    );
+    const employee = employees.get(dto.employee_id)!;
 
-    if (empError || !employee) {
-      throw new NotFoundException(`Employé ${dto.employee_id} introuvable`);
-    }
+    const legalParams =
+      (payroll.legal_parameters as unknown as LegalParameters | null) ??
+      (await this.getApplicableLegalParameters(
+        firstOfMonth(payroll.year, payroll.month),
+        accessToken,
+      ));
 
-    const legalParams = payroll.legal_parameters as unknown as LegalParameters;
-    const result = calculatePayslip(
+    const calc = calculatePayslip(
       {
-        base_salary: dto.base_salary ?? employee.base_salary,
-        salary_currency: employee.salary_currency as 'USD' | 'CDF',
+        base_salary: dto.base_salary ?? Number(employee.base_salary),
+        salary_currency: employee.salary_currency,
         bonuses: dto.bonuses ?? 0,
         overtime: dto.overtime ?? 0,
         absences_deductions: dto.absences_deductions ?? 0,
         advances: dto.advances ?? 0,
-        dependent_children: employee.dependent_children,
-        usd_cdf_rate: payroll.usd_cdf_rate,
+        dependent_children: employee.dependent_children ?? 0,
+        usd_cdf_rate: Number(payroll.usd_cdf_rate),
       },
       legalParams,
     );
 
-    const payslipData = {
-      payroll_id: payrollId,
-      employee_id: dto.employee_id,
-      base_salary: result.base_salary,
-      salary_currency: employee.salary_currency,
-      bonuses: result.bonuses,
-      overtime: result.overtime,
-      absences_deductions: result.absences_deductions,
-      advances: result.advances,
-      gross_salary: result.gross_salary,
-      cnss_employee: result.cnss_employee,
-      ipr: result.ipr,
-      net_payable: result.net_payable,
-      cnss_employer: result.cnss_employer,
-    };
-
-    const { data: payslip, error: psError } = await client
-      .from('payslips')
-      .upsert(payslipData, { onConflict: 'payroll_id,employee_id' })
-      .select()
-      .single();
-
-    if (psError) throw new InternalServerErrorException(psError.message);
-
-    await client.from('payslip_items').delete().eq('payslip_id', payslip.id);
-
-    await client.from('payslip_items').insert(
-      result.items.map((item) => ({
-        ...item,
-        payslip_id: payslip.id,
-      })),
-    );
-
-    return { payslip, calculation_detail: result };
+    const payslip = await this.upsertPayslip(client, payrollId, employee, calc);
+    return { payslip, calculation_detail: calc };
   }
 
-  async closePayroll(payrollId: string, accessToken: string) {
+  async closePayroll(
+    payrollId: string,
+    companyId: string,
+    accessToken: string,
+  ) {
     const client = this.supabase.getClientForUser(accessToken);
-    const { data: payroll } = await client
-      .from('payrolls')
-      .select('*, legal_parameters(*)')
-      .eq('id', payrollId)
-      .single();
+    const payroll = await this.getOwnPayroll(payrollId, companyId, accessToken);
 
-    if (!payroll) throw new NotFoundException(`Payroll ${payrollId} introuvable`);
+    if (payroll.status === 'closed') {
+      throw new ConflictException('Cette paie est déjà clôturée.');
+    }
 
     const { data, error } = await client
       .from('payrolls')
@@ -534,6 +617,7 @@ export class PayrollService {
         legal_parameters_snapshot: payroll.legal_parameters,
       })
       .eq('id', payrollId)
+      .eq('company_id', companyId)
       .select()
       .single();
 
@@ -547,29 +631,24 @@ export class PayrollService {
     accessToken: string,
   ) {
     const client = this.supabase.getClientForUser(accessToken);
+    await this.getOwnPayroll(payrollId, companyId, accessToken);
+
     const { data: employees, error } = await client
       .from('employees')
-      .select('*')
+      .select('id')
       .eq('company_id', companyId)
       .eq('status', 'active');
-
     if (error) throw new InternalServerErrorException(error.message);
 
-    const results: any[] = [];
+    const results: Array<{ employee_id: string; status: 'success' }> = [];
     for (const employee of employees ?? []) {
-      const result = await this.calculateAndSavePayslip(
+      await this.calculateAndSavePayslip(
         payrollId,
-        {
-          employee_id: employee.id,
-          base_salary: employee.base_salary,
-          bonuses: 0,
-          overtime: 0,
-          absences_deductions: 0,
-          advances: 0,
-        },
+        { employee_id: employee.id },
+        companyId,
         accessToken,
       );
-      results.push({ employee_id: employee.id, status: 'success', result });
+      results.push({ employee_id: employee.id, status: 'success' });
     }
 
     return { processed: results.length, results };

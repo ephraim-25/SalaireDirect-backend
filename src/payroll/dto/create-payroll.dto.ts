@@ -1,17 +1,7 @@
-import {
-  IsString,
-  IsNumber,
-  IsInt,
-  IsUUID,
-  Min,
-  Max,
-  IsPositive,
-} from 'class-validator';
+import { IsNumber, IsInt, Min, Max, IsPositive } from 'class-validator';
 
+/** L'entreprise est déterminée par le serveur à partir de l'utilisateur connecté (jamais par le client). */
 export class CreatePayrollDto {
-  @IsUUID()
-  company_id: string;
-
   @IsInt()
   @Min(1)
   @Max(12)

@@ -1,9 +1,6 @@
 import { createParamDecorator, ExecutionContext } from '@nestjs/common';
 
-/**
- * Décorateur @CurrentUser() - Extrait l'utilisateur authentifié de la requête.
- * Usage: @CurrentUser() user: User
- */
+/** Décorateur @CurrentUser() - Utilisateur authentifié (vérifié par JwtAuthGuard). */
 export const CurrentUser = createParamDecorator(
   (data: unknown, ctx: ExecutionContext) => {
     const request = ctx.switchToHttp().getRequest();
@@ -11,12 +8,21 @@ export const CurrentUser = createParamDecorator(
   },
 );
 
-/**
- * Décorateur @AccessToken() - Extrait le token JWT de la requête.
- */
+/** Décorateur @AccessToken() - Jeton JWT Supabase de la requête (déjà vérifié). */
 export const AccessToken = createParamDecorator(
   (data: unknown, ctx: ExecutionContext) => {
     const request = ctx.switchToHttp().getRequest();
     return request.accessToken;
+  },
+);
+
+/**
+ * Décorateur @CompanyId() - Entreprise de l'utilisateur, déterminée côté serveur.
+ * Ne jamais lui préférer un identifiant d'entreprise envoyé par le client.
+ */
+export const CompanyId = createParamDecorator(
+  (data: unknown, ctx: ExecutionContext) => {
+    const request = ctx.switchToHttp().getRequest();
+    return request.companyId as string;
   },
 );

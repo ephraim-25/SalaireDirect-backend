@@ -3,12 +3,13 @@ import {
   IsOptional,
   IsEnum,
   IsNumber,
-  IsDate,
   IsInt,
   Min,
+  Max,
+  MaxLength,
+  IsNotEmpty,
   IsDateString,
 } from 'class-validator';
-import { Type } from 'class-transformer';
 
 export enum MobileMoneyOperator {
   M_PESA = 'M-Pesa',
@@ -28,12 +29,17 @@ export enum CurrencyEnum {
 
 export class CreateEmployeeDto {
   @IsString()
+  @IsNotEmpty()
+  @MaxLength(100)
   first_name: string;
 
   @IsString()
+  @IsNotEmpty()
+  @MaxLength(100)
   last_name: string;
 
   @IsString()
+  @MaxLength(150)
   @IsOptional()
   position?: string;
 
@@ -45,8 +51,9 @@ export class CreateEmployeeDto {
   @IsOptional()
   cnss_number?: string;
 
-  @IsNumber()
+  @IsNumber({ maxDecimalPlaces: 2 })
   @Min(0)
+  @Max(1_000_000_000)
   base_salary: number;
 
   @IsEnum(CurrencyEnum)
@@ -71,6 +78,7 @@ export class CreateEmployeeDto {
 
   @IsInt()
   @Min(0)
+  @Max(20)
   @IsOptional()
   dependent_children?: number;
 

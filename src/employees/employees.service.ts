@@ -7,30 +7,25 @@ import { SupabaseService } from '../supabase/supabase.service';
 import { CreateEmployeeDto } from './dto/create-employee.dto';
 import { UpdateEmployeeDto } from './dto/update-employee.dto';
 
+/**
+ * Toutes les requêtes sont filtrées par l'entreprise de l'utilisateur (déterminée par le serveur),
+ * EN PLUS des règles RLS de Supabase : une défense en profondeur contre les accès entre entreprises.
+ */
 @Injectable()
 export class EmployeesService {
   constructor(private readonly supabase: SupabaseService) {}
 
-  async getDefaultCompanyId(accessToken: string): Promise<string> {
-    const client = this.supabase.getClientForUser(accessToken);
-    const { data } = await client.from('companies').select('id').limit(1).single();
-    return data?.id || '00000000-0000-0000-0000-000000000001';
-  }
-
-  async findAll(companyId?: string, accessToken: string = 'dev-token', status?: string) {
+  async findAll(companyId: string, accessToken: string, status?: string) {
     const client = this.supabase.getClientForUser(accessToken);
 
     let query = client
       .from('employees')
       .select('*')
+      .eq('company_id', companyId)
       .order('last_name', { ascending: true });
 
-    if (companyId) {
-      query = query.eq('company_id', companyId);
-    }
-
-    if (status) {
-      query = query.eq('status', status as 'active' | 'inactive');
+    if (status === 'active' || status === 'inactive') {
+      query = query.eq('status', status);
     }
 
     const { data, error } = await query;
@@ -38,29 +33,25 @@ export class EmployeesService {
     return data;
   }
 
-  async findOne(id: string, accessToken: string = 'dev-token', companyId?: string) {
+  async findOne(id: string, companyId: string, accessToken: string) {
     const client = this.supabase.getClientForUser(accessToken);
+    const { data, error } = await client
+      .from('employees')
+      .select('*')
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .maybeSingle();
 
-    let query = client.from('employees').select('*').eq('id', id);
-
-    if (companyId) {
-      query = query.eq('company_id', companyId);
-    }
-
-    const { data, error } = await query.single();
-
-    if (error || !data) throw new NotFoundException(`Employé ${id} introuvable`);
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!data) throw new NotFoundException(`Employé ${id} introuvable`);
     return data;
   }
 
-  async create(dto: CreateEmployeeDto & { company_id?: string }, accessToken: string = 'dev-token', companyId?: string) {
+  async create(dto: CreateEmployeeDto, companyId: string, accessToken: string) {
     const client = this.supabase.getClientForUser(accessToken);
-
-    const targetCompanyId = companyId || dto.company_id || (await this.getDefaultCompanyId(accessToken));
-
     const { data, error } = await client
       .from('employees')
-      .insert({ ...dto, company_id: targetCompanyId })
+      .insert({ ...dto, company_id: companyId })
       .select()
       .single();
 
@@ -71,49 +62,51 @@ export class EmployeesService {
   async update(
     id: string,
     dto: UpdateEmployeeDto,
-    accessToken: string = 'dev-token',
-    companyId?: string,
+    companyId: string,
+    accessToken: string,
   ) {
     const client = this.supabase.getClientForUser(accessToken);
-
-    let query = client
+    const { data, error } = await client
       .from('employees')
       .update(dto)
-      .eq('id', id);
-
-    if (companyId) {
-      query = query.eq('company_id', companyId);
-    }
-
-    const { data, error } = await query.select().single();
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .select()
+      .maybeSingle();
 
     if (error) throw new InternalServerErrorException(error.message);
+    if (!data) throw new NotFoundException(`Employé ${id} introuvable`);
     return data;
   }
 
-  /** Désactivation logique (soft delete) ou suppression */
-  async deactivate(id: string, accessToken: string = 'dev-token', companyId?: string) {
+  /** Désactivation logique : l'historique de paie est conservé. */
+  async deactivate(id: string, companyId: string, accessToken: string) {
     const client = this.supabase.getClientForUser(accessToken);
-
-    let query = client
+    const { data, error } = await client
       .from('employees')
       .update({ status: 'inactive' })
-      .eq('id', id);
-
-    if (companyId) {
-      query = query.eq('company_id', companyId);
-    }
-
-    const { data, error } = await query.select().single();
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .select()
+      .maybeSingle();
 
     if (error) throw new InternalServerErrorException(error.message);
+    if (!data) throw new NotFoundException(`Employé ${id} introuvable`);
     return { message: 'Employé désactivé', employee: data };
   }
 
-  async deletePermanent(id: string, accessToken: string = 'dev-token') {
+  async deletePermanent(id: string, companyId: string, accessToken: string) {
     const client = this.supabase.getClientForUser(accessToken);
-    const { error } = await client.from('employees').delete().eq('id', id);
+    const { data, error } = await client
+      .from('employees')
+      .delete()
+      .eq('id', id)
+      .eq('company_id', companyId)
+      .select('id');
+
     if (error) throw new InternalServerErrorException(error.message);
+    if (!data || data.length === 0)
+      throw new NotFoundException(`Employé ${id} introuvable`);
     return { message: 'Employé supprimé définitivement' };
   }
 }
